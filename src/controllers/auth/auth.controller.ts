@@ -10,9 +10,19 @@ import {
   verifyRefreshToken,
 } from "../../lib/token";
 import crypto from "crypto";
+import { OAuth2Client } from "google-auth-library";
 
 function getAppUrl() {
   return process.env.APP_URL || `http://localhost:${process.env.PORT}`;
+}
+
+function getGoogleClient() {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const redirectUri = process.env.GOOGLE_REDIRECT_URI; // <--- This must be the callback URL
+
+  // ...
+  return new OAuth2Client(clientId, clientSecret, redirectUri);
 }
 
 export async function registerHandler(req: Request, res: Response) {
@@ -339,6 +349,118 @@ export async function resetPasswordHandler(req: Request, res: Response) {
     await user.save();
     return res.status(200).json({
       message: "Password reset successfully",
+    });
+  } catch (error) {
+    console.log(error);
+    return res.status(500).json({
+      message: "Internal Server Error",
+    });
+  }
+}
+
+export async function googleAuthStartHandler(_req: Request, res: Response) {
+  try {
+    const client = getGoogleClient();
+
+    const authUrl = client.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: ["openid", "email", "profile"],
+    });
+    console.log("DEBUG: Generated Auth URL:", authUrl);
+    return res.redirect(authUrl);
+  } catch (error) {
+    console.log(error);
+    return res.status(500).json({
+      message: "Internal Server Error",
+    });
+  }
+}
+
+export async function googleAuthCallbackHandler(req: Request, res: Response) {
+  const code = req.query.code as string | undefined;
+
+  // 1. Validation Logic
+  if (!code) {
+    return res.status(400).json({
+      message: "Code is required",
+    });
+  } // <--- Close the IF block here
+
+  // 2. Main Logic (Runs if code exists)
+  try {
+    const client = getGoogleClient();
+    const { tokens } = await client.getToken(code);
+
+    console.log(tokens, code, "code");
+    if (!tokens.id_token) {
+      return res.status(400).json({
+        message: "ID token is required",
+      });
+    }
+    const ticket = await client.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: process.env.GOOGLE_CLIENT_ID as string,
+    });
+    const payload = ticket.getPayload();
+
+    const email = payload?.email;
+    const emailVerified = payload?.email_verified;
+
+    if (!email || !emailVerified) {
+      return res.status(400).json({
+        message: "Invalid email or email verification",
+      });
+    }
+
+    const normalizedEmail = email.toLocaleLowerCase().trim();
+    let user = await User.findOne({ email: normalizedEmail });
+    if (!user) {
+      const randomPassword = crypto.randomBytes(16).toString("hex");
+      const hashedPassword = await hashPassword(randomPassword);
+      user = await User.create({
+        email: normalizedEmail,
+        passwordHash: hashedPassword,
+        name: payload?.given_name,
+        isEmailVerified: true,
+        role: "user",
+        twoFactorEnabled: false,
+      });
+    } else {
+      if (!user.isEmailVerified) {
+        user.isEmailVerified = true;
+        await user.save();
+      }
+    }
+
+    const accessToken = createAccessToken(
+      user.id,
+      user.role as "user" | "admin",
+      user.tokenVersion
+    );
+    const refreshToken = createRefreshToken(
+      user.id,
+      user.role,
+      user.tokenVersion
+    );
+    const isProd = process.env.NODE_ENV === "production";
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: isProd,
+      sameSite: "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+    return res.status(200).json({
+      message: "Refresh successful",
+      accessToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        isEmailVerified: user.isEmailVerified,
+        twoFactorEnabled: user.twoFactorEnabled,
+      },
     });
   } catch (error) {
     console.log(error);
